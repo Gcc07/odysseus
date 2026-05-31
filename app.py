@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Dict
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -600,11 +600,26 @@ app.include_router(setup_contacts_routes())
 
 def _serve_html_with_nonce(request: Request, file_path: str) -> HTMLResponse:
     """Read an HTML file and inject the CSP nonce into inline <script> tags."""
-    with open(file_path, "r") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         html = f.read()
     nonce = getattr(request.state, "csp_nonce", "")
     html = html.replace("{{CSP_NONCE}}", nonce)
     return HTMLResponse(html)
+
+_FAVICON_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
+    "<path d='M16 4L16 22L6 22Z' fill='#e06c75'/>"
+    "<path d='M16 8L16 22L24 22Z' fill='#e06c75' opacity='0.6'/>"
+    "<path d='M4 24Q10 20 16 24Q22 28 28 24' stroke='#e06c75' "
+    "stroke-width='2.5' fill='none' stroke-linecap='round'/>"
+    "</svg>"
+)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(content=_FAVICON_SVG, media_type="image/svg+xml")
+
 
 @app.get("/")
 async def serve_index(request: Request):

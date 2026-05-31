@@ -4,9 +4,8 @@ import asyncio
 import json
 import logging
 import os
-import pty
-import fcntl
 import shlex
+import sys
 import shutil
 import uuid
 import tempfile
@@ -16,6 +15,11 @@ from typing import Dict, Any
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+_HAS_PTY = sys.platform != "win32"
+if _HAS_PTY:
+    import fcntl
+    import pty
 
 
 def _require_admin(request: Request):
@@ -97,6 +101,11 @@ async def _exec_shell(command: str, timeout: int = EXEC_TIMEOUT) -> Dict[str, An
 
 async def _generate_pty(cmd: str, timeout: int, request: Request):
     """Run command in a pseudo-TTY so tqdm/progress bars work natively."""
+    if not _HAS_PTY:
+        yield f"data: {json.dumps({'stream': 'stderr', 'data': 'PTY mode is not supported on Windows'})}\n\n"
+        yield f"data: {json.dumps({'exit_code': -1})}\n\n"
+        return
+
     loop = asyncio.get_event_loop()
     master_fd, slave_fd = pty.openpty()
 
@@ -378,6 +387,13 @@ def setup_shell_routes() -> APIRouter:
                 _generate_tmux(cmd, request),
                 media_type="text/event-stream",
             )
+
+        if use_pty and not _HAS_PTY:
+            async def pty_unavailable():
+                yield f"data: {json.dumps({'stream': 'stderr', 'data': 'PTY mode is not supported on Windows'})}\n\n"
+                yield f"data: {json.dumps({'exit_code': -1})}\n\n"
+
+            return StreamingResponse(pty_unavailable(), media_type="text/event-stream")
 
         if use_pty:
             return StreamingResponse(
