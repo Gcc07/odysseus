@@ -4,6 +4,8 @@ import subprocess
 import time
 
 CACHE_TTL = 1800  # 30 min — hardware rarely changes; use the Rescan button to force a re-probe
+HOST_HW_TTL = 86400  # 24 h — host profile written by scripts/windows/write-host-hardware.ps1
+_IS_WINDOWS = platform.system() == "Windows"
 
 
 _remote_host = None  # set by detect_system(host=...)
@@ -321,7 +323,10 @@ def _detect_windows():
         "}; "
         "$r | ConvertTo-Json -Compress"
     )
-    out = _run(f'powershell -Command "{ps_cmd}"')
+    if _remote_host:
+        out = _run(f'powershell -Command "{ps_cmd}"')
+    else:
+        out = _run(["powershell", "-NoProfile", "-Command", ps_cmd])
     if not out:
         return None
     import json as _json
@@ -363,6 +368,63 @@ def _detect_windows():
 _cache_by_host = {}  # host -> (timestamp, result)
 
 
+def _in_docker() -> bool:
+    return os.path.exists("/.dockerenv")
+
+
+def _host_hardware_path() -> str:
+    override = os.getenv("ODYSSEUS_HOST_HARDWARE_FILE", "").strip()
+    if override:
+        return override
+    base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(base, "data", "host_hardware.json")
+
+
+def _load_host_hardware():
+    """Load a host-written hardware profile (Docker on Windows can't see the GPU)."""
+    path = _host_hardware_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        import json
+
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        updated = float(data.get("updated_at") or 0)
+        if updated and (time.time() - updated) > HOST_HW_TTL:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _merge_host_hardware(result, host_hw):
+    if not host_hw:
+        return result
+    merged = dict(result)
+    for key in (
+        "total_ram_gb", "available_ram_gb", "cpu_cores", "cpu_name",
+        "has_gpu", "gpu_name", "gpu_vram_gb", "gpu_count", "backend",
+        "gpus", "gpu_groups", "homogeneous",
+    ):
+        if key in host_hw:
+            merged[key] = host_hw[key]
+    merged["hardware_source"] = host_hw.get("hardware_source") or "host"
+    merged.pop("gpu_error", None)
+    return merged
+
+
+def _apply_host_hardware_if_available(result, cache_key):
+    if cache_key != "_local":
+        return result
+    host_hw = _load_host_hardware()
+    if not host_hw:
+        return result
+    if _in_docker() or not result.get("has_gpu"):
+        return _merge_host_hardware(result, host_hw)
+    return result
+
+
 def detect_system(host="", ssh_port="", platform="", fresh=False):
     """Detect system hardware: RAM, CPU, GPU. Cached per host (hardware rarely
     changes, and probing a remote host over SSH is slow). Pass fresh=True to
@@ -377,18 +439,29 @@ def detect_system(host="", ssh_port="", platform="", fresh=False):
     if not fresh and cache_key in _cache_by_host:
         ts, cached = _cache_by_host[cache_key]
         if (now - ts) < CACHE_TTL:
-            return cached
+            return _apply_host_hardware_if_available(cached, cache_key)
 
     _remote_host = host or None
     _remote_port = ssh_port or None
     _remote_platform = platform or None
 
-    # Windows: single PowerShell command for all hardware info
+    # Local Windows: Linux probes (/proc/meminfo, /sys/class/drm) don't exist.
+    if not _remote_host and _IS_WINDOWS:
+        result = _detect_windows()
+        if result:
+            _remote_host = None
+            _remote_platform = None
+            result = _apply_host_hardware_if_available(result, cache_key)
+            _cache_by_host[cache_key] = (now, result)
+            return result
+
+    # Windows: single PowerShell command for all hardware info (remote via SSH)
     if _remote_platform == "windows" and _remote_host:
         result = _detect_windows()
         if result:
             _remote_host = None
             _remote_platform = None
+            result = _apply_host_hardware_if_available(result, cache_key)
             _cache_by_host[cache_key] = (now, result)
             return result
         # If Windows detection failed, return error
@@ -453,5 +526,6 @@ def detect_system(host="", ssh_port="", platform="", fresh=False):
 
     _remote_host = None
     _remote_platform = None
+    result = _apply_host_hardware_if_available(result, cache_key)
     _cache_by_host[cache_key] = (now, result)
     return result
